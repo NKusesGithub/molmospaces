@@ -1,4 +1,4 @@
-!/usr/bin/env bash
+#!/usr/bin/env bash
 # Host bring-up script for the CrazySwarm2 / Isaac Sim / MolmoSpaces rig.
 #
 # STAGED, NOT ONE-SHOT. The driver step requires a reboot and can, in the
@@ -12,9 +12,9 @@
 # Keep this file version-controlled in your dotfiles/molmospaces repo — the
 # TARGET_DRIVER_BRANCH line below is the single source of truth for which
 # driver branch this rig needs.
- 
+
 set -euo pipefail
- 
+
 # ---- config — the one place that records "which driver branch this rig needs" ----
 TARGET_DRIVER_BRANCH="580"   # R580 confirmed compatible; R595 causes librtx.scenedb.plugin.so
                               # segfaults on this rig (see Notion: Isaac-Sim Troubles)
@@ -34,13 +34,13 @@ MOLMO_REPO_URL="${MOLMO_REPO_URL:-}"
 CONTAINER_NAME="isaac-sim"
 IMAGE_NAME="isaac-sim-molmo:latest"
 DOCKERFILE_DIR="$(dirname "$(readlink -f "$0")")"
- 
+
 echo "=================================================================="
 echo "Stage 1: NVIDIA driver"
 echo "=================================================================="
 current_version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo "")"
 current_branch="${current_version%%.*}"
- 
+
 if [[ "$current_branch" == "$TARGET_DRIVER_BRANCH" ]]; then
   echo "Driver already on R${TARGET_DRIVER_BRANCH} branch (${current_version}) — skipping."
 else
@@ -49,17 +49,17 @@ else
   echo "!! This purges the existing NVIDIA driver and installs a different branch. !!"
   read -r -p "Continue? [y/N] " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
- 
+
   sudo apt-get update
   sudo apt-get purge -y '^nvidia-.*' || true
   sudo add-apt-repository -y ppa:graphics-drivers/ppa
   sudo apt-get update
- 
+
   # Package name may vary slightly (e.g. an "-open" variant) depending on what's
   # currently published to the PPA — check with `apt-cache search nvidia-driver-580`
   # if this exact name 404s.
   sudo apt-get install -y "nvidia-driver-${TARGET_DRIVER_BRANCH}"
- 
+
   echo
   echo "=================================================================="
   echo "Driver installed. A REBOOT IS REQUIRED before continuing."
@@ -70,7 +70,7 @@ else
   echo "=================================================================="
   exit 0
 fi
- 
+
 echo "=================================================================="
 echo "Stage 2: Docker Engine"
 echo "=================================================================="
@@ -84,13 +84,17 @@ if ! command -v docker &>/dev/null; then
 else
   echo "Docker already installed — skipping."
 fi
- 
+
 echo "=================================================================="
 echo "Stage 3: NVIDIA Container Toolkit"
 echo "=================================================================="
 if ! dpkg -l 2>/dev/null | grep -q nvidia-container-toolkit; then
+  # --yes: skip the interactive "File exists. Overwrite?" prompt gpg raises on a rerun
+  # after any earlier partial attempt — without it, this hangs waiting on stdin instead
+  # of proceeding. Safe to force: this only overwrites NVIDIA's own public signing key,
+  # re-fetched fresh from their server every time, never anything user-authored.
   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-    | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    | sudo gpg --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
   curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
     | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
     | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
@@ -101,12 +105,12 @@ if ! dpkg -l 2>/dev/null | grep -q nvidia-container-toolkit; then
 else
   echo "nvidia-container-toolkit already installed — skipping."
 fi
- 
+
 echo "=================================================================="
 echo "Stage 4: X11 access for the container"
 echo "=================================================================="
 xhost +local:docker
- 
+
 echo "=================================================================="
 echo "Stage 5: MolmoSpaces checkout"
 echo "=================================================================="
@@ -128,12 +132,12 @@ echo "Permissions opened on $MOLMO_REPO_PATH so the container's non-root user ca
 echo "(Using sudo here — this path can contain files created by container processes"
 echo "running as a different UID than your host user, e.g. anything copied via"
 echo "'docker exec' without -u root. Plain chmod can only touch files you own.)"
- 
+
 mkdir -p "$MOLMO_CACHE_PATH"
 sudo chmod -R a+rwX "$MOLMO_CACHE_PATH"
 echo "Asset cache directory ready at $MOLMO_CACHE_PATH (created here, as your normal user,"
 echo "so it isn't left root-owned by Docker auto-creating it — same UID trap as before)."
- 
+
 echo "=================================================================="
 echo "Stage 6: Container image + container"
 echo "=================================================================="
@@ -141,7 +145,7 @@ if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
   echo "Building $IMAGE_NAME from $DOCKERFILE_DIR/Dockerfile ..."
   docker build -t "$IMAGE_NAME" "$DOCKERFILE_DIR"
 fi
- 
+
 if ! docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   docker run --name "$CONTAINER_NAME" --entrypoint bash -d --runtime=nvidia --gpus all \
     -e "DISPLAY=$DISPLAY" -v /tmp/.X11-unix:/tmp/.X11-unix \
@@ -153,19 +157,38 @@ if ! docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
 elif [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" != "true" ]]; then
   docker start "$CONTAINER_NAME"
 fi
- 
+
 echo "=================================================================="
 echo "Stage 7: MolmoSpaces pip install (inside the container)"
 echo "=================================================================="
 # molmo_spaces_isaac (Isaac Sim integration) and the root molmo_spaces package
 # (housegen extra) are separate installs from separate directories.
-docker exec "$CONTAINER_NAME" bash -c \
-  "cd /isaac-sim/molmospaces/molmo_spaces_isaac && /isaac-sim/python.sh -m pip install -e .[dev,sim]"
-docker exec "$CONTAINER_NAME" bash -c \
-  "cd /isaac-sim/molmospaces && /isaac-sim/python.sh -m pip install -e .[housegen]"
- 
+#
+# FIX: these two cd targets were relative ("molmospaces/molmo_spaces_isaac",
+# "molmospaces") in the copy that was actually failing. A `docker exec` session
+# starts in the image's WORKDIR (/isaac-sim/molmospaces, set in the Dockerfile),
+# so a *relative* "molmospaces/..." from there resolved to the doubled-up,
+# nonexistent /isaac-sim/molmospaces/molmospaces/... — hence "No such file or
+# directory" even though the bind mount itself was correct. Made absolute below
+# so they no longer depend on whatever directory docker exec happens to start in.
+#
+# Also restored the importability check (present in this file's own header
+# comment — "every other stage is idempotent" — but missing from Stage 7 as
+# received): skips both pip installs on a rerun once the packages already
+# import cleanly, instead of re-running pip every single time.
+if docker exec "$CONTAINER_NAME" bash -c \
+  "/isaac-sim/python.sh -c 'import molmo_spaces_isaac, molmo_spaces.housegen.exporter' &>/dev/null"; then
+  echo "molmo_spaces_isaac and housegen already importable in this container — skipping pip install."
+  echo "(To force a clean reinstall: docker exec -u root -it $CONTAINER_NAME rm -rf"
+  echo " /isaac-sim/kit/python/lib/python3.11/site-packages/molmo_spaces* , then rerun this script —"
+  echo " or just recreate the container, which has the same effect.)"
+else
+  docker exec "$CONTAINER_NAME" bash -c \
+    "cd /isaac-sim/molmospaces/molmo_spaces_isaac && /isaac-sim/python.sh -m pip install -e .[dev,sim]"
+  docker exec "$CONTAINER_NAME" bash -c \
+    "cd /isaac-sim/molmospaces && /isaac-sim/python.sh -m pip install -e .[housegen]"
+fi
+
 echo "=================================================================="
 echo "Done. Enter the container with: docker exec -it $CONTAINER_NAME bash"
 echo "=================================================================="
- 
-
