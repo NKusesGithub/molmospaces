@@ -31,8 +31,20 @@ MOLMO_CACHE_PATH="${MOLMO_CACHE_PATH:-$HOME/S_ENG/molmospaces-cache}"
 # (an SSH agent with the right key, or a credential helper), which varies by
 # machine, so this stays opt-in rather than assumed.
 MOLMO_REPO_URL="${MOLMO_REPO_URL:-}"
+# Read-only mounts for scene generation inputs. Holodeck's generated scenes live
+# under data/scenes/<name>-<timestamp>/<name>.json; objathor holds the source
+# .pkl.gz vertex data for Objaverse assets that aren't in the published
+# MolmoSpaces USD set. Skipped automatically if the directories don't exist.
+HOLODECK_PATH="${HOLODECK_PATH:-$HOME/S_ENG/Holodeck}"
+OBJATHOR_PATH="${OBJATHOR_PATH:-$HOME/.objathor-assets}"
 CONTAINER_NAME="isaac-sim"
-IMAGE_NAME="isaac-sim-molmo:latest"
+# NOTE: :with-molmospaces is a `docker commit` of a container that had already had
+# `pip install -e .[dev,sim]` run inside it (Stage 7). The plain :latest image built
+# from the Dockerfile contains ONLY molmospaces_resources — recreating a container
+# from it means re-running that whole install, which pulls IsaacSim + IsaacLab again.
+# Falls back to :latest when the committed image isn't present (e.g. a fresh machine).
+IMAGE_NAME="isaac-sim-molmo:with-molmospaces"
+docker image inspect "$IMAGE_NAME" &>/dev/null || IMAGE_NAME="isaac-sim-molmo:latest"
 DOCKERFILE_DIR="$(dirname "$(readlink -f "$0")")"
 
 echo "=================================================================="
@@ -147,10 +159,19 @@ if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
 fi
 
 if ! docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+  # Holodeck scene JSONs and the objathor source assets are mounted read-only so
+  # the container can read them in place. Both are optional — the mount flags are
+  # only added when the host directory actually exists, so this still works on a
+  # machine that has no Holodeck checkout.
+  extra_mounts=()
+  [[ -d "$HOLODECK_PATH" ]] && extra_mounts+=(-v "$HOLODECK_PATH":/isaac-sim/Holodeck:ro)
+  [[ -d "$OBJATHOR_PATH" ]] && extra_mounts+=(-v "$OBJATHOR_PATH":/isaac-sim/objathor-assets:ro)
+
   docker run --name "$CONTAINER_NAME" --entrypoint bash -d --runtime=nvidia --gpus all \
     -e "DISPLAY=$DISPLAY" -v /tmp/.X11-unix:/tmp/.X11-unix \
     -v "$MOLMO_REPO_PATH":/isaac-sim/molmospaces \
     -v "$MOLMO_CACHE_PATH":/isaac-sim/.molmospaces \
+    "${extra_mounts[@]}" \
     --network host \
     "$IMAGE_NAME" -c "tail -f /dev/null"
   echo "Container '$CONTAINER_NAME' started."
