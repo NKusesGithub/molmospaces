@@ -6,9 +6,9 @@ drone-swarm rig.
 
 ## Contents
 
-- [`Dockerfile`](./Dockerfile) — builds `isaac-sim-molmo:latest` from NVIDIA's official Isaac Sim
+- [`Dockerfile`](./molmo-isaac-docker-setup/Dockerfile) — builds `isaac-sim-molmo:latest` from NVIDIA's official Isaac Sim
   5.1.0 image, with every environment-level fix discovered while setting this up baked in.
-- [`setup_host.sh`](./setup_host.sh) — staged, idempotent host bring-up script: driver → Docker
+- [`setup_host.sh`](./molmo-isaac-docker-setup/setup_host.sh) — staged, idempotent host bring-up script: driver → Docker
   Engine → NVIDIA Container Toolkit → X11 → repo checkout → container → pip installs.
 
 ## Requirements
@@ -53,7 +53,7 @@ where each one should actually run:
 |---|---|---|
 | `molmo_spaces_isaac` | Yes — imports Isaac Sim/Kit modules directly | Inside the container, no alternative |
 | `housegen` (root `molmo_spaces` package) | No — deps are just `open3d`, `p_tqdm`, `prior` | Inside the container currently, for convenience; not required |
-| [Holodeck](https://github.com/allenai/Holodeck) | No — separate repo entirely, only output is a JSON file | Recommended: a separate host-side venv |
+| [Holodeck](https://github.com/allenai/Holodeck) | No — separate repo entirely, only output is a JSON file | Recommended: its own conda env (Python 3.10) |
 
 ### Bind mounts
 
@@ -149,19 +149,35 @@ Holodeck **composes** scenes (floor plan, object selection and placement via an 
 not generate 3D assets. Objects are retrieved from [Objaverse](https://objaverse.allenai.org/)
 (~800K pre-existing 3D models), not modeled from scratch.
 
-### Recommended: run it in its own venv, not the container
+### Recommended: its own conda env, not the container
+
+Holodeck's own README specifies conda with a **pinned Python 3.10** — this matters, since the
+default `python3` on this rig is 3.14 and Holodeck won't run on it. The `ai2thor` install is a
+separate step against a custom index and a pinned commit; `requirements.txt` alone is not enough.
 
 ```bash
-python3 -m venv ~/S_ENG/holodeck-env
-source ~/S_ENG/holodeck-env/bin/activate
 git clone <your-fork-of-Holodeck> ~/S_ENG/Holodeck
 cd ~/S_ENG/Holodeck
+
+conda create --name holodeck python=3.10
+conda activate holodeck
 pip install -r requirements.txt
+pip install --extra-index-url https://ai2thor-pypi.allenai.org \
+  ai2thor==0+8524eadda94df0ab2dbb2ef5a577e4d37c712897
+
 python main.py --query "an office" --openai_api_key <OPENAI_API_KEY>
 ```
 
-This produces a JSON file — that's the handoff point into `housegen` (Stage 2 above), which does
-need to run inside the container. No Isaac Sim dependency exists on the Holodeck side at all.
+On this rig that env lives at `~/S_ENG/miniconda3/envs/holodeck` (Python 3.10.21). Generated
+scenes land in `~/S_ENG/Holodeck/data/scenes/<query>-<timestamp>/<query>.json`.
+
+That JSON is the handoff point — either into `housegen` (Stage 2 above, inside the container), or
+into the [direct USD pipeline](#holodeck-scene--isaac-usd-pipeline) below. No Isaac Sim dependency
+exists on the Holodeck side at all.
+
+The env already carries `numpy` and `scipy`, so it's also a viable home for
+`compose_holodeck_scene.py`, which needs only those plus `pxr` (`pip install usd-core`) — no
+Isaac runtime. That keeps scene generation and scene composition in one place.
 
 ### Model choice
 
@@ -187,142 +203,56 @@ concurrently on the same GPU.
 
 ## Holodeck Scene → Isaac USD Pipeline
 
+**→ Full reference: [`scripts/assets/README.md`](./scripts/assets/README.md)**
+
 The [Scene Generation Pipeline](#scene-generation-pipeline) above is the *house* pipeline —
 `housegen` compiles THOR-format JSON (rooms, walls, doors, windows) into a settled MuJoCo scene,
-which `molmo_spaces_isaac` then converts to USD. It hard-requires that house structure: object
-body names must match a specific `\w+_[0-9a-f]{32}_\d+_\d+_\d+` pattern and a sibling
-`_metadata.json`, or conversion silently drops the object.
+which `molmo_spaces_isaac` converts to USD. It hard-requires that house structure: object body
+names must match `\w+_[0-9a-f]{32}_\d+_\d+_\d+` and have a sibling `_metadata.json`, or
+conversion silently drops the object.
 
-For a Holodeck scene that's just furniture in a single room — no need for `housegen`'s wall/door/
-window authoring or its 20-second physics settle — three scripts under
+For a Holodeck scene that's just furniture in a single room, three scripts under
 [`scripts/assets/`](./scripts/assets/) go straight from Holodeck's JSON to a loadable USD stage,
-skipping the MuJoCo step entirely:
+skipping MuJoCo entirely:
 
 | Script | Stage | Input → Output |
 |---|---|---|
-| [`fetch_holodeck_assets.py`](./scripts/assets/fetch_holodeck_assets.py) | 1 | Scene JSON → pre-converted USD assets pulled from the MolmoSpaces R2 bucket |
-| [`convert_missing_assets.py`](./scripts/assets/convert_missing_assets.py) | 2 (optional) | objathor `.pkl.gz` source → USD, for any asset step 1 didn't find |
-| [`compose_holodeck_scene.py`](./scripts/assets/compose_holodeck_scene.py) | 3 | Scene JSON + the USD assets above → one `scene.usda` |
-
-All three run inside the container via `/isaac-sim/python.sh`. Stage 3 needs only `pxr`
-(`usd-core`), not the Isaac Sim runtime, so it's near-instant and safe to iterate on.
-
-### 1. Fetch pre-converted assets
+| [`fetch_holodeck_assets.py`](./scripts/assets/fetch_holodeck_assets.py) | 1 | Scene JSON → pre-converted USD assets from the MolmoSpaces R2 bucket |
+| [`convert_missing_assets.py`](./scripts/assets/convert_missing_assets.py) | 2 (optional) | objathor `.pkl.gz` → USD, for anything step 1 didn't find |
+| [`compose_holodeck_scene.py`](./scripts/assets/compose_holodeck_scene.py) | 3 | Scene JSON + those assets → one `scene.usda` |
 
 ```bash
-docker exec isaac-sim bash -c 'cd /isaac-sim/molmospaces && /isaac-sim/python.sh \
-  scripts/assets/fetch_holodeck_assets.py \
-  --scenes /isaac-sim/Holodeck/data/scenes/*/*.json \
+cd /isaac-sim/molmospaces            # inside the container
+SCENE=/isaac-sim/Holodeck/data/scenes/<dir>/<name>.json
+
+/isaac-sim/python.sh scripts/assets/fetch_holodeck_assets.py --scenes "$SCENE" \
   --cache-dir /isaac-sim/.molmospaces/isaac-thor-resources \
-  --symlink-dir /isaac-sim/molmospaces/assets/isaac-usd'
-```
+  --symlink-dir /isaac-sim/molmospaces/assets/isaac-usd \
+  --out scratch/missing_assets.json
 
-Scans every scene's `objects`, splits ids into THOR names vs. 32-hex Objaverse UIDs, and for each
-Objaverse UID calls `ResourceManager.index_lookup` / `install_packages` against the same R2
-bucket `usda_downloader.py` targets. **`usda_downloader.py` itself does not run** — it's written
-against an older `molmospaces_resources` API (`archives_with_substring`, `install_objects`, …)
-that doesn't match what's actually installed (0.0.2, which has `index_lookup` /
-`install_packages` instead). `fetch_holodeck_assets.py` is the same idea, rewired to the current
-API. THOR assets aren't looked up this way — their index tokens are archive-based, not asset
-names — so the script just checks presence against `--thor-dir` (get those via the normal
-`ms-download --assets thor`).
-
-Writes a `missing_assets.json` next to wherever you run it, listing every UID that isn't in the
-published set — feeds directly into step 2. `--dry-run` resolves everything without downloading,
-useful for a coverage check first.
-
-### 2. Convert what's missing
-
-Only needed if step 1 reported misses. Two sub-stages, matching the real MolmoSpaces release
-pipeline:
-
-```bash
-docker exec isaac-sim bash -c 'cd /isaac-sim/molmospaces && /isaac-sim/python.sh \
-  scripts/assets/convert_missing_assets.py \
-  --missing-json missing_assets.json \
+/isaac-sim/python.sh scripts/assets/convert_missing_assets.py \
+  --missing-json scratch/missing_assets.json \
   --objathor-dir /isaac-sim/objathor-assets/2023_09_23/assets \
-  --mjcf-out scratch/mjcf \
-  --usd-out /isaac-sim/molmospaces/assets/isaac-usd/objects/objaverse \
-  --max-workers 8 --skip-existing'
-```
+  --mjcf-out scratch/mjcf --max-workers 8 --skip-existing \
+  --usd-out "$(readlink -f assets/isaac-usd/objects/objaverse)"
 
-- **objathor → MJCF**: `molmo_spaces.housegen.utils.create_mujoco_model_from_objaverse`, called
-  in-process per UID.
-- **MJCF → USD**: `molmo_spaces_isaac.assets.asset_converter --mode convert-all --is-objaverse`,
-  run once over the whole batch.
-
-Needs `compress_json`, `msgpack`, `open3d`, `prior` — none shipped in the base image, only
-`housegen`'s own dependency list (root `pyproject.toml`'s `[housegen]` extra) when actually
-installed. `pip install compress_json msgpack open3d prior` inside the container if
-`create_mujoco_model_from_objaverse` raises `ModuleNotFoundError`.
-
-**Known data issue, worked around automatically:** the objathor `2023_09_23` release stores each
-asset's texture paths as absolutes from the box that generated them (e.g.
-`/root/processed_models/<uid>/albedo.jpg`), while the files sit locally as plain basenames. The
-converter joins path-onto-directory and expects a basename, so an absolute path resolves to
-nothing and the mesh write fails. `convert_missing_assets.py` stages a corrected copy of each
-asset (paths rewritten to basenames) before conversion — your objathor store itself is never
-touched.
-
-### 3. Compose the scene
-
-```bash
-docker exec isaac-sim bash -c 'cd /isaac-sim/molmospaces && /isaac-sim/python.sh \
-  scripts/assets/compose_holodeck_scene.py \
-  --scene /isaac-sim/Holodeck/data/scenes/<dir>/<name>.json \
+/isaac-sim/python.sh scripts/assets/compose_holodeck_scene.py --scene "$SCENE" \
   --thor-dir /isaac-sim/.molmospaces/usd/objects/thor/20260128 \
   --obja-dir /isaac-sim/molmospaces/assets/isaac-usd/objects/objaverse \
-  --out scratch/out/scene.usda'
+  --out scratch/out/scene.usda
 ```
 
-Add `--dynamic` to let non-`kinematic` objects fall under gravity instead of freezing every
-object as static geometry (the default). Prints a placed/skipped count; anything skipped means
-its asset still isn't on disk anywhere — back to step 1/2.
+Stage 3 needs only `pxr` (`usd-core`), not the Isaac runtime, so it runs in under a second.
+Useful flags: `--dynamic` (let non-`kinematic` objects fall), `--snap-to-receptacle` (fix small
+objects floating above furniture), `--no-walls`, `--keep-duplicates`.
 
-If small objects are floating above the furniture they're supposed to sit on, add
-`--snap-to-receptacle` — see the last bullet below before reaching for it.
+Stage 2 needs `housegen`'s deps, which the base image doesn't carry:
+`pip install compress_json msgpack open3d prior` inside the container.
 
-Four things worth knowing if you're editing this script or debugging a scene it produced:
-
-- **Position**: Holodeck/Unity is `(x, y-up, z)` in metres already — `(x, y, z) → (x, z, y)`, no
-  unit scaling. (Confirmed independently against `usd_assets_metadata.json`'s `bbox_size`
-  entries, e.g. `CD_1` is 0.112 — an 11cm CD.)
-- **Rotation**: the converted USD assets keep their original **Y-up** mesh orientation — the
-  *stage* is Z-up, the *assets* are not re-axised into it. Confirmed two independent ways: bbox
-  shape (`Plate_27` is `(0.292, 0.012, 0.292)`, thin in Y) and by downloading a published
-  `holodeck-objaverse-train/train_0` scene and reverse-engineering its authored quaternions,
-  every one of which factors as `Rx(+90°) · Ry(θ)`. The conversion is `Rx(+90°)` applied to
-  Holodeck's Euler angles negated for its left-handed convention — **not** an axis-permutation
-  matrix, which was the first (wrong) approach tried here and looked plausible until checked
-  against real data.
-- **Static objects**: making an object immovable means `RemoveAPI("PhysicsRigidBodyAPI")`, not
-  `kinematicEnabled = True` — the published scenes never use the latter. For an *articulated*
-  asset (e.g. `Desk_313_2` has 6 `PhysicsPrismaticJoint`s for its drawers), every joint under it
-  must also be deactivated, not just `PhysicsFixedJoint`s — PhysX errors ("no bodies defined at
-  body0 and body1") the moment a joint references a body that just lost its rigid-body API.
-- **Exact-position duplicates**: on by default, Holodeck occasionally places two+ objects at
-  literally the same point (desk lamp ×4 at one position was observed in practice) — harmless in
-  a frozen scene, but as dynamic rigid bodies the coincident collision generates enough contact
-  force to launch them apart on the first physics step. Filtered at load (mirrors housegen's
-  `filter_stage_holodeck_duplicates`, same tolerance); `--keep-duplicates` to disable.
-- **Floating receptacle-relative objects**: small objects carry a compound id like
-  `"computer monitor-0|office_desk-4 (office)"` — the part after `|` names the receptacle
-  they're meant to rest on. Their authored height assumes Holodeck's internal size estimate for
-  that `assetId` matches what we actually resolved; it doesn't always. Observed case: Holodeck
-  mapped a "computer monitor" to THOR's `Television_13`, whose real bbox is 0.745m tall —
-  TV-sized, not monitor-sized — so the authored Y put it ~0.5m above the desk. Confirmed this is
-  a Holodeck-side data mismatch, not a placement bug in this script: desks and freestanding
-  chairs land at `z ≈ 0` with the identical translate math, and the object is placed exactly
-  where its own JSON says (`position.y = 1.57`, verified against the composed transform). Since
-  these objects are `kinematic: true`, physics can't fix it even with `--dynamic`.
-
-  `--snap-to-receptacle` rewrites just the Z of every compound-id object to rest its *already
-  placed* bbox directly on the receptacle's *already placed* bbox — X/Y and orientation
-  untouched, and it's a no-op if either side wasn't placed (missing asset). Off by default,
-  since most objects don't need it — turn it on only after actually seeing floaters, since it
-  fixes height, not the underlying size mismatch (that monitor still renders as a TV-sized
-  object, just a grounded one). One-level only: a receptacle that's itself compound-id gets
-  snapped using its own pre-snap bbox, not a fully resolved chain.
+The pipeline README covers the coordinate/rotation conventions (assets are **Y-up** inside a Z-up
+stage), why static objects need `RemoveAPI("PhysicsRigidBodyAPI")` plus deactivating *every*
+joint type, the duplicate and receptacle-snapping heuristics, verification recipes, and what this
+pipeline gives up versus `housegen` (no settle, no materials, no doors/windows).
 
 ## Common Issues
 
