@@ -1,0 +1,121 @@
+# syntax=docker/dockerfile:1
+# ROS 2 Jazzy (Ubuntu 24.04) + AgileX agx_arm_ros dependencies, layered onto the
+# Isaac Sim + MolmoSpaces image. Built by setup_script.sh — see that file for why
+# this is a separate layer rather than an edit to ./Dockerfile.
+#
+# Two Pythons live in this image and must not be mixed:
+#   - Isaac Sim: Python 3.11 (/isaac-sim/python.sh). Talks ROS 2 through the
+#     isaacsim.ros2.bridge extension's own bundled Jazzy libs + rclpy.
+#   - ROS 2 Jazzy: system Python 3.12 (/usr/bin/python3). Runs agx_arm_ros nodes.
+# Sourcing /opt/ros/jazzy/setup.bash puts 3.12 packages on PYTHONPATH, which Isaac
+# Sim's 3.11 interpreter then tries to import. So nothing here sources ROS
+# globally; each shell picks /opt/agx_env/ros2_env.sh or isaac_ros2_env.sh.
+
+ARG BASE_IMAGE=isaac-sim-molmo:with-molmospaces
+FROM ${BASE_IMAGE}
+
+ARG ROS_APT_SOURCE_VERSION=1.2.0
+ENV ROS_DISTRO=jazzy
+
+USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# No `apt-get upgrade` (unlike ./Dockerfile): upgrading the NVIDIA base image's
+# packages wholesale can drift libraries Isaac Sim was validated against.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg2 locales software-properties-common && \
+    locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8 && \
+    add-apt-repository -y universe && \
+    curl -fL -o /tmp/ros2-apt-source.deb \
+        "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${ROS_APT_SOURCE_VERSION}/ros2-apt-source_${ROS_APT_SOURCE_VERSION}.$(. /etc/os-release && echo "$VERSION_CODENAME")_all.deb" && \
+    apt-get install -y /tmp/ros2-apt-source.deb && \
+    rm -rf /tmp/ros2-apt-source.deb /var/lib/apt/lists/*
+
+# MoveIt misparses numbers under non-English LC_NUMERIC (agx_arm_ros README).
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Mirrors the <depend> tags in agx_arm_ros/src/*/package.xml plus
+# scripts/agx_arm_install_deps.sh. Explicit instead of that script's
+# `ros-jazzy-moveit*` / `ros-jazzy-control*` globs, which pull in hundreds of
+# unused packages. Two package.xml keys have no Jazzy binary and are skipped:
+#   rviz                - ROS 1 name; rviz2 is listed alongside it
+#   warehouse_ros_mongo - not released for Jazzy; warehouse_ros_sqlite instead
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ros-jazzy-ros-base \
+        ros-dev-tools \
+        ros-jazzy-rmw-fastrtps-cpp \
+        ros-jazzy-ros2-control \
+        ros-jazzy-ros2-controllers \
+        ros-jazzy-controller-manager \
+        ros-jazzy-joint-trajectory-controller \
+        ros-jazzy-gripper-controllers \
+        ros-jazzy-joint-state-publisher \
+        ros-jazzy-joint-state-publisher-gui \
+        ros-jazzy-robot-state-publisher \
+        ros-jazzy-xacro \
+        ros-jazzy-topic-tools \
+        ros-jazzy-trajectory-msgs \
+        ros-jazzy-tf2-ros \
+        ros-jazzy-moveit-configs-utils \
+        ros-jazzy-moveit-kinematics \
+        ros-jazzy-moveit-planners \
+        ros-jazzy-moveit-ros-move-group \
+        ros-jazzy-moveit-ros-perception \
+        ros-jazzy-moveit-ros-visualization \
+        ros-jazzy-moveit-ros-warehouse \
+        ros-jazzy-moveit-simple-controller-manager \
+        ros-jazzy-warehouse-ros-sqlite \
+        ros-jazzy-rviz2 \
+        ros-jazzy-rviz-default-plugins \
+        can-utils ethtool iproute2 \
+        python3-pip python3-can python3-scipy python3-numpy python3-typing-extensions && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN [ -f /etc/ros/rosdep/sources.list.d/20-default.list ] || rosdep init
+
+# pyAgxArm (the CAN SDK agx_arm_ctrl imports) goes into the SYSTEM Python 3.12.
+# Bind-mounted from the `pyagxarm` build context so the checkout isn't baked into
+# a layer; `rw` lets pip write its in-tree build dir, discarded after this step.
+# --no-deps: python-can and typing-extensions come from apt above, and pip must
+# not replace apt-owned packages (which --break-system-packages would allow).
+RUN --mount=type=bind,from=pyagxarm,target=/tmp/pyAgxArm,rw \
+    python3 -m pip install --no-deps --no-cache-dir --break-system-packages /tmp/pyAgxArm && \
+    python3 -c "import pyAgxArm, can, scipy"
+
+# If the base is isaac-sim-molmo:latest, ./Dockerfile appended a global
+# `source /opt/ros/jazzy/setup.bash` to .bashrc — the exact mix described at the
+# top of this file. Remove it; the env scripts below replace it per shell.
+RUN sed -i '\#source /opt/ros/jazzy/setup.bash#d' /isaac-sim/.bashrc && \
+    mkdir -p /opt/agx_env
+
+COPY <<'EOF' /opt/agx_env/ros2_env.sh
+# ROS 2 Jazzy shell for agx_arm_ros nodes (system Python 3.12).
+# Don't source this in the shell that launches Isaac Sim; use isaac_ros2_env.sh.
+source /opt/ros/jazzy/setup.bash
+if [ -f /isaac-sim/agx_arm_ws/install/setup.bash ]; then
+    source /isaac-sim/agx_arm_ws/install/setup.bash
+fi
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+EOF
+
+COPY <<'EOF' /opt/agx_env/isaac_ros2_env.sh
+# Shell for launching Isaac Sim against its bundled ROS 2 Jazzy bridge libs.
+# Strips system-ROS / workspace entries in case ros2_env.sh was sourced first.
+export ROS_DISTRO=jazzy
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+_agx_strip_ros() { printf '%s' "$1" | tr ':' '\n' | grep -vE '^(/opt/ros/|/isaac-sim/agx_arm_ws/)' | paste -sd: -; }
+export PYTHONPATH="$(_agx_strip_ros "${PYTHONPATH:-}")"
+LD_LIBRARY_PATH="$(_agx_strip_ros "${LD_LIBRARY_PATH:-}")"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/isaac-sim/exts/isaacsim.ros2.bridge/jazzy/lib"
+unset AMENT_PREFIX_PATH CMAKE_PREFIX_PATH COLCON_PREFIX_PATH
+unset -f _agx_strip_ros
+EOF
+
+# Gazebo Harmonic (the Gazebo release paired with Jazzy) + ros_gz, for viewing
+# the agx_arm URDFs outside Isaac Sim via agx_arm_gazebo.launch.py. Kept as the
+# last layer so adding it reuses the build cache for everything above.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ros-jazzy-ros-gz && \
+    rm -rf /var/lib/apt/lists/*
+
+USER isaac-sim

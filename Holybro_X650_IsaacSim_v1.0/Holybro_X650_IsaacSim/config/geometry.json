@@ -1,0 +1,44 @@
+{
+  "source_step": "x650-frame-2025-0825.stp",
+  "coordinate_conversion": "Creo (X,Y-up,Z) -> Isaac/ROS (X,-Z,Y), metres",
+  "wheelbase_m_measured": 0.64661,
+  "propeller_geometry": "synthetic 15.5-inch two-blade visual proxy; source STEP contains no propellers",
+  "rotors": [
+    {
+      "number": 0,
+      "position_m": [
+        0.22859462671676808,
+        -0.22859462671387637,
+        0.03099999999830112
+      ],
+      "mesh": "x650_prop_0.stl"
+    },
+    {
+      "number": 1,
+      "position_m": [
+        0.22859462671384517,
+        0.22859462671678837,
+        0.03099999999757648
+      ],
+      "mesh": "x650_prop_1.stl"
+    },
+    {
+      "number": 2,
+      "position_m": [
+        -0.22859462671675568,
+        0.2285946267137924,
+        0.030999999999966634
+      ],
+      "mesh": "x650_prop_2.stl"
+    },
+    {
+      "number": 3,
+      "position_m": [
+        -0.2285946267137925,
+        -0.22859462671675568,
+        0.030999999999966717
+      ],
+      "mesh": "x650_prop_3.stl"
+    }
+  ]
+}

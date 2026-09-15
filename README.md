@@ -6,9 +6,9 @@ drone-swarm rig.
 
 ## Contents
 
-- [`Dockerfile`](./molmo-isaac-docker-setup/Dockerfile) — builds `isaac-sim-molmo:latest` from NVIDIA's official Isaac Sim
+- [`Dockerfile`](./scripts/docker/Dockerfile) — builds `isaac-sim-molmo:latest` from NVIDIA's official Isaac Sim
   5.1.0 image, with every environment-level fix discovered while setting this up baked in.
-- [`setup_host.sh`](./molmo-isaac-docker-setup/setup_host.sh) — staged, idempotent host bring-up script: driver → Docker
+- [`setup_host.sh`](./scripts/docker/setup_host.sh) — staged, idempotent host bring-up script: driver → Docker
   Engine → NVIDIA Container Toolkit → X11 → repo checkout → container → pip installs.
 
 ## Requirements
