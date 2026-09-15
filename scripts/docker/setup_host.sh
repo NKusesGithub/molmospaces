@@ -56,7 +56,10 @@ CONTAINER_NAME="isaac-sim"
 # from the Dockerfile contains ONLY molmospaces_resources — recreating a container
 # from it means re-running that whole install, which pulls IsaacSim + IsaacLab again.
 # Falls back to :latest when the committed image isn't present (e.g. a fresh machine).
-IMAGE_NAME="isaac-sim-molmo:with-molmospaces"
+# :ros2-jazzy (built by setup_script.sh on top of :with-molmospaces) is preferred when
+# present, so a recreated isaac-sim container keeps ROS 2 Jazzy.
+IMAGE_NAME="isaac-sim-molmo:ros2-jazzy"
+docker image inspect "$IMAGE_NAME" &>/dev/null || IMAGE_NAME="isaac-sim-molmo:with-molmospaces"
 docker image inspect "$IMAGE_NAME" &>/dev/null || IMAGE_NAME="isaac-sim-molmo:latest"
 DOCKERFILE_DIR="$(dirname "$(readlink -f "$0")")"
 
@@ -181,6 +184,16 @@ if ! docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   extra_mounts=()
   [[ -d "$HOLODECK_PATH" ]] && extra_mounts+=(-v "$HOLODECK_PATH":/isaac-sim/Holodeck:ro)
   [[ -d "$OBJATHOR_PATH" ]] && extra_mounts+=(-v "$OBJATHOR_PATH":/isaac-sim/objathor-assets:ro)
+  # agx_arm_ros workspace built by setup_script.sh. install/setup.bash hardcodes
+  # /isaac-sim/agx_arm_ws, so it must be mounted at exactly that path. The nested
+  # mountpoint is pre-created as your user; Docker would otherwise create it root-owned.
+  AGX_WS_PATH="${AGX_WS_PATH:-$HOME/S_ENG/agx_arm_ws}"
+  AGX_REPO_PATH="${AGX_REPO_PATH:-$HOME/S_ENG/agx_arm_ros}"
+  if [[ -d "$AGX_WS_PATH/install" && -d "$AGX_REPO_PATH" ]]; then
+    mkdir -p "$AGX_WS_PATH/src/agx_arm_ros"
+    extra_mounts+=(-v "$AGX_WS_PATH":/isaac-sim/agx_arm_ws)
+    extra_mounts+=(-v "$AGX_REPO_PATH":/isaac-sim/agx_arm_ws/src/agx_arm_ros:ro)
+  fi
 
   docker run --name "$CONTAINER_NAME" --entrypoint bash -d --runtime=nvidia --gpus all \
     -e "DISPLAY=$DISPLAY" -v /tmp/.X11-unix:/tmp/.X11-unix \
