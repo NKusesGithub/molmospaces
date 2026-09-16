@@ -1,21 +1,29 @@
 # syntax=docker/dockerfile:1
-# ROS 2 Jazzy (Ubuntu 24.04) + AgileX agx_arm_ros dependencies, layered onto the
-# Isaac Sim + MolmoSpaces image. Built by setup_script.sh — see that file for why
-# this is a separate layer rather than an edit to ./Dockerfile.
+# ROS 2 Jazzy (Ubuntu 24.04) + AgileX agx_arm_ros dependencies + Gazebo Harmonic,
+# layered onto the Isaac Sim + MolmoSpaces image. Built by setup_script.sh — see
+# that file for why this is a separate layer rather than an edit to ./Dockerfile.
 #
 # Two Pythons live in this image and must not be mixed:
 #   - Isaac Sim: Python 3.11 (/isaac-sim/python.sh). Talks ROS 2 through the
 #     isaacsim.ros2.bridge extension's own bundled Jazzy libs + rclpy.
 #   - ROS 2 Jazzy: system Python 3.12 (/usr/bin/python3). Runs agx_arm_ros nodes.
 # Sourcing /opt/ros/jazzy/setup.bash puts 3.12 packages on PYTHONPATH, which Isaac
-# Sim's 3.11 interpreter then tries to import. So nothing here sources ROS
-# globally; each shell picks /opt/agx_env/ros2_env.sh or isaac_ros2_env.sh.
+# Sim's 3.11 interpreter then tries to import.
+#
+# How each side gets its ROS 2:
+#   - Isaac Sim: NVIDIA's /isaac-sim/setup_ros_env.sh (sourced by isaac-sim.sh and
+#     the other GUI launchers, and by python.sh via the hook below) sets
+#     ROS_DISTRO=jazzy and adds the bridge's bundled libs to LD_LIBRARY_PATH, but
+#     only when ROS_DISTRO is unset. So this image must not set ROS_DISTRO
+#     globally. Nor may it put the bridge libs on the global LD_LIBRARY_PATH:
+#     they include their own libssl/libcrypto, which would then shadow the
+#     system's for git, curl and apt.
+#   - System ROS 2: `ros2env` (alias for /opt/agx_env/ros2_env.sh), per shell.
 
 ARG BASE_IMAGE=isaac-sim-molmo:with-molmospaces
 FROM ${BASE_IMAGE}
 
 ARG ROS_APT_SOURCE_VERSION=1.2.0
-ENV ROS_DISTRO=jazzy
 
 USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -84,7 +92,7 @@ RUN --mount=type=bind,from=pyagxarm,target=/tmp/pyAgxArm,rw \
 
 # If the base is isaac-sim-molmo:latest, ./Dockerfile appended a global
 # `source /opt/ros/jazzy/setup.bash` to .bashrc — the exact mix described at the
-# top of this file. Remove it; the env scripts below replace it per shell.
+# top of this file. Remove it; ros2env replaces it per shell.
 RUN sed -i '\#source /opt/ros/jazzy/setup.bash#d' /isaac-sim/.bashrc && \
     mkdir -p /opt/agx_env
 
@@ -112,10 +120,22 @@ unset -f _agx_strip_ros
 EOF
 
 # Gazebo Harmonic (the Gazebo release paired with Jazzy) + ros_gz, for viewing
-# the agx_arm URDFs outside Isaac Sim via agx_arm_gazebo.launch.py. Kept as the
-# last layer so adding it reuses the build cache for everything above.
+# the agx_arm URDFs outside Isaac Sim via agx_arm_gazebo.launch.py.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ros-jazzy-ros-gz && \
     rm -rf /var/lib/apt/lists/*
+
+# python.sh (standalone Isaac Sim scripts, MolmoSpaces) doesn't source
+# setup_ros_env.sh the way isaac-sim.sh does; hook it into setup_python_env.sh,
+# which python.sh sources. NO_ROS_ENV=true skips it, like isaac-sim.sh --no-ros-env.
+# `ros2env`: system ROS 2 Jazzy + the agx_arm workspace for the current shell.
+RUN printf '\n[ "${NO_ROS_ENV:-false}" = true ] || source "/isaac-sim/setup_ros_env.sh"\n' >> /isaac-sim/setup_python_env.sh && \
+    echo "alias ros2env='source /opt/agx_env/ros2_env.sh'" >> /isaac-sim/.bashrc
+
+# ./Dockerfile's ACCEPT_EULA=Y only satisfies NVIDIA's container entrypoint
+# (license.sh, run by runheadless.sh), which these containers bypass with
+# --entrypoint bash. Kit's own check (kit/kit_app.py) reads OMNI_KIT_ACCEPT_EULA;
+# without it, headless python.sh apps block on an interactive EULA prompt.
+ENV OMNI_KIT_ACCEPT_EULA=YES
 
 USER isaac-sim

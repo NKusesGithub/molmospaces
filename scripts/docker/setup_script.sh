@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 # Builds ROS 2 Jazzy (Ubuntu 24.04) on top of the Isaac Sim + MolmoSpaces image,
-# verifies it, then builds the AgileX agx_arm_ros workspace against it.
+# verifies it, builds the AgileX agx_arm_ros workspace against it, and moves the
+# single `isaac-sim` container onto that image.
 #
 # Why a new image (Dockerfile.ros2) instead of rebuilding ./Dockerfile:
-#   The `isaac-sim` container runs isaac-sim-molmo:with-molmospaces, a
-#   `docker commit` that predates the ROS lines in ./Dockerfile, so it has no
-#   /opt/ros. Rebuilding ./Dockerfile would drop everything that commit baked in
-#   (the MolmoSpaces pip install — see setup_host.sh Stage 7). Dockerfile.ros2
-#   layers ROS on top of whichever base image setup_host.sh uses, and the
-#   existing `isaac-sim` container is never touched.
+#   isaac-sim-molmo:with-molmospaces is a `docker commit` that predates the ROS
+#   lines in ./Dockerfile, so it has no /opt/ros. Rebuilding ./Dockerfile would
+#   drop everything that commit baked in (the MolmoSpaces pip install — see
+#   setup_host.sh Stage 7). Dockerfile.ros2 layers ROS on top of whichever base
+#   image setup_host.sh uses.
+#
+# Inside the container:
+#   - Isaac Sim's bundled ROS 2 bridge turns on whenever Isaac Sim starts, via
+#     NVIDIA's setup_ros_env.sh (isaac-sim.sh, and python.sh through the hook in
+#     Dockerfile.ros2).
+#   - `ros2env` adds system ROS 2 + the agx_arm workspace to the current shell.
 #
 # Run setup_host.sh first (driver, Docker, NVIDIA toolkit, base image).
 # Every stage is idempotent; rerun freely.
 #
 # Usage:
-#   ./setup_script.sh                     # build image, verify, build workspace
+#   ./setup_script.sh                     # build image, verify, build workspace, update isaac-sim
 #   FORCE_REBUILD=1 ./setup_script.sh     # rebuild image (e.g. after the base image changed)
-#   BUILD_WORKSPACE=0 ./setup_script.sh   # image + verification only
-#   CREATE_CONTAINER=1 ./setup_script.sh  # also create an `isaac-sim-ros2` container
+#   BUILD_WORKSPACE=0 ./setup_script.sh   # skip the workspace build
+#   SETUP_CONTAINER=0 ./setup_script.sh   # leave the isaac-sim container alone
 
 set -euo pipefail
 
@@ -39,8 +45,11 @@ AGX_WS_PATH="${AGX_WS_PATH:-$HOME/S_ENG/agx_arm_ws}"
 WS_IN_CONTAINER="/isaac-sim/agx_arm_ws"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
 BUILD_WORKSPACE="${BUILD_WORKSPACE:-1}"
-CREATE_CONTAINER="${CREATE_CONTAINER:-0}"
-ROS_CONTAINER_NAME="${ROS_CONTAINER_NAME:-isaac-sim-ros2}"
+SETUP_CONTAINER="${SETUP_CONTAINER:-1}"
+# Same name setup_host.sh uses: one container for Isaac Sim, MolmoSpaces and ROS 2.
+CONTAINER_NAME="isaac-sim"
+BACKUP_CONTAINER_NAME="${CONTAINER_NAME}-pre-ros2"
+BRIDGE_LIB_DIR="/isaac-sim/exts/isaacsim.ros2.bridge/jazzy/lib"
 # package.xml keys with no Jazzy binary (see Dockerfile.ros2).
 ROSDEP_SKIP_KEYS="rviz warehouse_ros_mongo"
 # Same host paths setup_host.sh mounts into `isaac-sim`.
@@ -100,11 +109,40 @@ stage "Stage 3: Verify ROS 2 inside $ROS_IMAGE"
 # Default bridge network, not host: keeps this smoke test's DDS traffic away from
 # any ROS 2 graph already running on the host (CrazySwarm2, drone_reformation).
 # No `set -u` inside: ROS setup.bash references unset variables.
-docker run --rm --entrypoint bash "$ROS_IMAGE" -c '
+docker run --rm --entrypoint bash -e BRIDGE_LIB_DIR="$BRIDGE_LIB_DIR" "$ROS_IMAGE" -c '
   set -eo pipefail
+  echo "Default environment (every process):"
+  [ -z "${ROS_DISTRO:-}" ] \
+    || { echo "ROS_DISTRO preset to $ROS_DISTRO: Isaac Sim setup_ros_env.sh would skip its bundled bridge libs"; exit 1; }
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *isaacsim.ros2.bridge*) echo "bridge libs on the global LD_LIBRARY_PATH: their libssl would shadow the system one"; exit 1 ;;
+  esac
+  case ":${PYTHONPATH:-}:" in
+    *"/opt/ros/"*) echo "system ROS is on PYTHONPATH by default"; exit 1 ;;
+  esac
+  echo "  no global ROS_DISTRO, bridge libs or system-ROS PYTHONPATH: ok"
+  case "${OMNI_KIT_ACCEPT_EULA:-}" in
+    [Yy]|[Yy][Ee][Ss]|1) echo "  OMNI_KIT_ACCEPT_EULA set, so headless Isaac Sim apps skip the EULA prompt: ok" ;;
+    *) echo "OMNI_KIT_ACCEPT_EULA not set: headless python.sh Isaac Sim apps block on the EULA prompt"; exit 1 ;;
+  esac
+  ! grep -q "/opt/ros" /isaac-sim/.bashrc \
+    || { echo "/isaac-sim/.bashrc sources system ROS directly"; exit 1; }
+  grep -q "^alias ros2env=" /isaac-sim/.bashrc \
+    || { echo "ros2env alias missing from /isaac-sim/.bashrc"; exit 1; }
+  echo "  .bashrc: ros2env alias present, no global ROS source: ok"
+
+  # The environment python.sh builds (it sources setup_python_env.sh).
+  (
+    SCRIPT_DIR=/isaac-sim
+    source /isaac-sim/setup_python_env.sh
+    [ "$ROS_DISTRO" = jazzy ] || exit 1
+    case ":$LD_LIBRARY_PATH:" in *":$BRIDGE_LIB_DIR:"*) ;; *) exit 1 ;; esac
+  ) || { echo "python.sh environment does not enable the Isaac Sim ROS 2 bridge"; exit 1; }
+  echo "  python.sh environment: ROS_DISTRO=jazzy + bundled bridge libs: ok"
+
+  echo "After ros2env (system ROS 2):"
   source /opt/agx_env/ros2_env.sh
-  echo "ROS_DISTRO=$ROS_DISTRO  RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION"
-  for pkg in rclpy controller_manager joint_trajectory_controller robot_state_publisher xacro moveit_ros_move_group; do
+  for pkg in rclpy controller_manager joint_trajectory_controller robot_state_publisher xacro moveit_ros_move_group ros_gz_sim; do
     printf "  %-28s %s\n" "$pkg" "$(ros2 pkg prefix "$pkg")"
   done
   python3 -c "import pyAgxArm; print(\"  pyAgxArm (system python3):\", pyAgxArm.__file__)"
@@ -115,13 +153,6 @@ docker run --rm --entrypoint bash "$ROS_IMAGE" -c '
   wait
   grep -q "data: ok" /tmp/echo.log || { echo "DDS pub/sub round-trip FAILED"; exit 1; }
   echo "  DDS pub/sub round-trip: ok"
-
-  test -d /isaac-sim/exts/isaacsim.ros2.bridge/jazzy/lib \
-    || { echo "Isaac Sim bundled Jazzy bridge libs missing"; exit 1; }
-  echo "  Isaac Sim bundled Jazzy bridge libs: present"
-  ! grep -q "/opt/ros" /isaac-sim/.bashrc \
-    || { echo "/isaac-sim/.bashrc still sources system ROS"; exit 1; }
-  echo "  /isaac-sim/.bashrc does not source system ROS: ok"
 '
 
 if [[ "$BUILD_WORKSPACE" == "1" ]]; then
@@ -156,11 +187,30 @@ if [[ "$BUILD_WORKSPACE" == "1" ]]; then
   ls "$AGX_WS_PATH/install"
 fi
 
-if [[ "$CREATE_CONTAINER" == "1" ]]; then
-  stage "Stage 5: Container $ROS_CONTAINER_NAME"
-  if docker ps -a --format '{{.Names}}' | grep -qx "$ROS_CONTAINER_NAME"; then
-    echo "Container $ROS_CONTAINER_NAME already exists — leaving it alone."
+if [[ "$SETUP_CONTAINER" == "1" ]]; then
+  stage "Stage 5: Container $CONTAINER_NAME on $ROS_IMAGE"
+  want_image_id="$(docker image inspect -f '{{.Id}}' "$ROS_IMAGE")"
+  have_image_id="$(docker inspect -f '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+
+  if [[ "$have_image_id" == "$want_image_id" ]]; then
+    echo "$CONTAINER_NAME already runs $ROS_IMAGE — leaving it alone."
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" != "true" ]]; then
+      docker start "$CONTAINER_NAME"
+    fi
   else
+    if [[ -n "$have_image_id" ]]; then
+      # Renamed and stopped, not deleted: the old container's writable layer can
+      # hold state that exists in no image and no bind mount.
+      if docker ps -a --format '{{.Names}}' | grep -qx "$BACKUP_CONTAINER_NAME"; then
+        die "$CONTAINER_NAME must be recreated on the new image, but the backup name" \
+            "$BACKUP_CONTAINER_NAME is taken. Once it's no longer needed: docker rm $BACKUP_CONTAINER_NAME"
+      fi
+      docker stop "$CONTAINER_NAME" > /dev/null
+      docker rename "$CONTAINER_NAME" "$BACKUP_CONTAINER_NAME"
+      echo "Previous $CONTAINER_NAME kept, stopped, as $BACKUP_CONTAINER_NAME."
+      echo "Remove it once the new container works for you: docker rm $BACKUP_CONTAINER_NAME"
+    fi
+
     mounts=()
     [[ -d "$MOLMO_REPO_PATH" ]]  && mounts+=(-v "$MOLMO_REPO_PATH":/isaac-sim/molmospaces)
     [[ -d "$MOLMO_CACHE_PATH" ]] && mounts+=(-v "$MOLMO_CACHE_PATH":/isaac-sim/.molmospaces)
@@ -168,45 +218,48 @@ if [[ "$CREATE_CONTAINER" == "1" ]]; then
     [[ -d "$OV_CACHE_PATH" ]]    && mounts+=(-v "$OV_CACHE_PATH":/isaac-sim/.cache/ov)
     [[ -d "$HOLODECK_PATH" ]]    && mounts+=(-v "$HOLODECK_PATH":/isaac-sim/Holodeck:ro)
     [[ -d "$OBJATHOR_PATH" ]]    && mounts+=(-v "$OBJATHOR_PATH":/isaac-sim/objathor-assets:ro)
+    mkdir -p "$AGX_WS_PATH/src/agx_arm_ros"
+    mounts+=(-v "$AGX_WS_PATH":"$WS_IN_CONTAINER")
+    mounts+=(-v "$AGX_REPO_PATH":"$WS_IN_CONTAINER/src/agx_arm_ros":ro)
 
-    # No guessed fallback: this host's display is :1, and a silent :0 bakes a wrong
-    # value into the container for good.
+    # No guessed fallback: this host's display is :1, and a silent :0 bakes a
+    # wrong value into the container for good.
     if [[ -z "${DISPLAY:-}" ]]; then
       echo "WARNING: DISPLAY is unset (not run from a desktop terminal?). GUI apps in the"
-      echo "container will need it per exec, e.g.: docker exec -it -e DISPLAY=:1 $ROS_CONTAINER_NAME bash"
+      echo "container will need it per exec, e.g.: docker exec -it -e DISPLAY=:1 $CONTAINER_NAME bash"
     fi
     # --network host: agx_arm_ros talks to CAN interfaces (can0 / vcan0) that live
     # in the host's network namespace, and DDS discovery with host-side ROS tools.
-    docker run --name "$ROS_CONTAINER_NAME" --entrypoint bash -d --runtime=nvidia --gpus all \
+    docker run --name "$CONTAINER_NAME" --entrypoint bash -d --runtime=nvidia --gpus all \
       -e "DISPLAY=${DISPLAY:-}" -v /tmp/.X11-unix:/tmp/.X11-unix \
       "${mounts[@]}" \
-      -v "$AGX_WS_PATH":"$WS_IN_CONTAINER" \
-      -v "$AGX_REPO_PATH":"$WS_IN_CONTAINER/src/agx_arm_ros":ro \
       --network host \
       "$ROS_IMAGE" -c "tail -f /dev/null"
-    echo "Container '$ROS_CONTAINER_NAME' started."
+    echo "Container '$CONTAINER_NAME' started on $ROS_IMAGE."
   fi
 fi
 
 stage "Done"
 cat <<EOF
-Image: $ROS_IMAGE   Workspace: $AGX_WS_PATH (mounted at $WS_IN_CONTAINER)
+Image: $ROS_IMAGE   Container: $CONTAINER_NAME
+Workspace: $AGX_WS_PATH (mounted at $WS_IN_CONTAINER)
 
-Use two separate shells in the container — never mix them:
+  docker exec -it $CONTAINER_NAME bash
 
-  # ROS 2 nodes (agx_arm_ros):
-  docker exec -it $ROS_CONTAINER_NAME bash
-  source /opt/agx_env/ros2_env.sh
+Isaac Sim's ROS 2 bridge (Jazzy, bundled libs) turns on by itself when Isaac Sim
+starts, from isaac-sim.sh or python.sh:
+  /isaac-sim/isaac-sim.sh
 
-  # Isaac Sim with its bundled ROS 2 bridge:
-  docker exec -it $ROS_CONTAINER_NAME bash
-  source /opt/agx_env/isaac_ros2_env.sh && /isaac-sim/isaac-sim.sh
+System ROS 2 + agx_arm_ros in the current shell (driver, MoveIt, rviz, Gazebo):
+  ros2env
+Start Isaac Sim and MolmoSpaces Python from a shell where you have NOT run ros2env.
+ros2env sets ROS_DISTRO (so Isaac Sim skips its bundled bridge libs) and puts ROS's
+Python 3.12 packages on PYTHONPATH. Open a new shell instead.
 
-  # Gazebo Harmonic with an agx_arm URDF (from the ROS 2 shell above).
-  # On the host first, so the container may open windows: xhost +local:docker
+Gazebo Harmonic with an agx_arm URDF, after ros2env
+(on the host first, so the container may open windows: xhost +local:docker):
   ros2 launch /isaac-sim/molmospaces/scripts/docker/agx_arm_gazebo.launch.py arm_type:=piper
 
-No container yet? Rerun with CREATE_CONTAINER=1.
 No physical arm? Virtual CAN has to be created on the HOST (containers share its
 kernel and, with --network host, its interfaces):
   sudo modprobe vcan

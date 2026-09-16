@@ -1,7 +1,7 @@
 """Open Gazebo Harmonic with an AgileX arm URDF from agx_arm_description.
 
-Run inside the ROS 2 container from a ROS shell:
-    source /opt/agx_env/ros2_env.sh
+Run inside the isaac-sim container, in a shell where you've run `ros2env`:
+    ros2env
     ros2 launch /isaac-sim/molmospaces/scripts/docker/agx_arm_gazebo.launch.py arm_type:=piper
 
 Move a joint (from any shell with Gazebo's CLI):
