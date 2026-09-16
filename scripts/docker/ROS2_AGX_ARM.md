@@ -150,6 +150,14 @@ in every shell involved, including the one that starts Isaac Sim, e.g. `export R
 
 ## Troubleshooting log
 
+**Binding a physics material to an imported robot silently binds nothing.** The URDF importer marks
+each link's `collisions` prim instanceable, so the collision meshes inside are instance proxies:
+`stage.Traverse()` never yields them (a helper reported "bound to 0 robot colliders" while returning
+success), while `Usd.TraverseInstanceProxies()` finds them — 11 `CollisionAPI` prims and 22 geometry
+prims under `/piper`, at paths like `/piper/base_link/collisions/base_link/node_STL_BINARY_`. USD also
+forbids authoring opinions on an instance proxy, so binding must happen on the instanceable
+`collisions` wrapper, from where it inherits to the meshes inside.
+
 **Headless Isaac Sim exits after ~3 s: `Do you accept the EULA? (Yes/No): Unable to bootstrap inner
 kit kernel: EOF when reading a line`.** Kit's own check (`/isaac-sim/kit/kit_app.py`) accepts only
 `OMNI_KIT_ACCEPT_EULA` in `y` / `yes` / `1`, or an `EULA_ACCEPTED` file; otherwise it prompts on stdin,
@@ -268,14 +276,73 @@ opened on display `:1`, rendering on the GPU (`gz sim gui` loaded NVIDIA's `libG
 `libEGL warning: egl: failed to create dri2 screen` lines come from Mesa's EGL, which glvnd tries
 before selecting NVIDIA's; they are harmless.
 
+## Isaac Sim: arm import and pick
+
+`agx_arm_gazebo.launch.py`'s counterpart for Isaac Sim is `agx_arm_isaac_pick.py`: it imports the
+Piper-with-gripper URDF, spawns a cube, and closes the gripper on it.
+
+```bash
+# 1. Prepare a plain URDF (xacro is ROS 2 / Python 3.12; Isaac Sim is Python 3.11)
+ros2env
+share=$(ros2 pkg prefix agx_arm_description)/share/agx_arm_description
+xacro $share/agx_arm_urdf/piper/urdf/piper_with_gripper_description.xacro \
+    | sed "s#package://agx_arm_description#$share#g" > /tmp/piper_gripper.urdf
+
+# 2. Run it from a shell that has NOT run ros2env
+/isaac-sim/python.sh /isaac-sim/molmospaces/scripts/docker/agx_arm_isaac_pick.py
+#   --gui to watch it, --cube to change the cube's edge length
+```
+
+**Import settings that matter** (`URDFCreateImportConfig` → `URDFParseAndImportFile`):
+`fix_base` (the arm is bolted down), position drives via `set_default_drive_type(1)` with stiffness
+and damping (the URDF carries no drive information, so the arm otherwise collapses under gravity),
+and `set_parse_mimic(False)` so `gripper_joint1` / `gripper_joint2` can be driven directly. The
+importer returns the articulation *root* (`/piper/root_joint`), not the robot prim — the robot is its
+parent, `/piper`. The 9 DOFs come back as `joint1…joint6, gripper, gripper_joint1, gripper_joint2`.
+
+**Getting the arm to the cube took measurement, not arithmetic.** Four attempts failed first, each
+for a different reason, and each fix came from measuring the running simulation:
+
+1. Joint angles picked from the URDF limits left the fingers 0.24 m above a cube on the ground.
+2. The "approach" pose assumed lowering `joint2` raises the hand — it lowers it, onto the floor.
+3. At `joint2=2.30` the jaw bodies span z[0.030, 0.125] while a 3 cm cube tops out at z=0.030: the
+   jaws closed in clear air above it and clipped its corner, shoving it 4 cm.
+4. At `joint2=2.35` with a 4 cm cube the jaws stalled at a 0.0163 m gap (the cube held them open) but
+   it still slid out during the lift — contact without grip.
+
+The working poses come from a `joint2` sweep at `joint3=-1.85`, where reach stays ~0.593 m while
+height tracks `joint2`: approach `2.20` (z=0.099), grasp `2.35`, lift `2.10` (z=0.166). Avoid
+`joint2 >= 2.40`: the fingers reach the floor and height stops responding.
+
+Useful check when a pose looks wrong: the arm converges within ~30 physics steps and then holds, so a
+stale reading means the pose was never commanded, not that it needs longer to settle. `joint2` sits
+about 0.07 rad below target from steady gravity droop, which is stable and already inside every
+measurement.
+
+**Result:** the cube lifts 0.149 m, then travels 0.210 m sideways with the gripper when `joint1`
+swings, staying 0.013 m from the finger midpoint throughout. Reproduced across runs with identical
+numbers; the run writes a viewport capture of the held pose to `/tmp/agx_arm_pick.png`.
+
+The sweep is the part that proves a grasp. Height plus proximity does not: "cube within 8 cm of the
+finger midpoint" is equally true of a cube that merely sits beside the fingers, and the first capture
+was ambiguous enough (a cube apparently floating next to a dark shape) to be worth disproving rather
+than explaining away. A free cube stays put when the arm swings away; this one followed. The script
+asserts all four conditions — lift > 0.02 m, cube-to-finger < 0.08 m, lateral travel > 0.05 m, and
+still < 0.08 m from the fingers afterwards — and prints the link chain's world positions, which is
+also how the "has the articulation come apart?" question gets answered (it hasn't: `base_link` through
+both fingers form a continuous chain).
+
+What actually makes it hold is **finger drive force**, not friction: `gripper_joint1` / `gripper_joint2`
+get `maxForce=500` and stiffness `1e5`, because the URDF gives those joints `effort=10` and the jaws
+otherwise stall against the cube. The high-friction material (bound to 24 robot colliders and the
+cube) changed nothing either way — the first passing run bound zero robot colliders and lifted the
+cube just the same.
+
 ## Next steps toward Isaac Sim
 
-1. Import an arm URDF (e.g. `piper/urdf/piper_description.urdf`) with the Isaac Sim URDF importer;
-   resolve the `package://agx_arm_description/` mesh paths against
-   `/isaac-sim/agx_arm_ws/install/agx_arm_description/share`.
-2. Wire the ROS 2 bridge (OmniGraph): subscribe to `control/joint_states` and drive the articulation;
+1. Wire the ROS 2 bridge (OmniGraph): subscribe to `control/joint_states` and drive the articulation;
    publish `feedback/joint_states` from the simulated joints. These are the topics `agx_arm_ctrl` uses.
-3. Decide whether Isaac Sim replaces the driver (sim-only) or a vCAN fake arm feeds the real driver.
+2. Decide whether Isaac Sim replaces the driver (sim-only) or a vCAN fake arm feeds the real driver.
 
 ## Environment reference
 
